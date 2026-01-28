@@ -31,7 +31,7 @@ CONTRIBUTOR_TYPES = {
 class OmekaArtistProcessor:
     """Process Omeka S items to add contributors to item sets."""
 
-    def __init__(self, api_url: str, key_identity: str, key_credential: str):
+    def __init__(self, api_url: str, key_identity: str, key_credential: str, verbose: bool = False):
         """
         Initialize the Omeka S API client.
 
@@ -39,10 +39,12 @@ class OmekaArtistProcessor:
             api_url: Base URL of the Omeka S API (e.g., 'https://example.com/api')
             key_identity: Omeka S key identity
             key_credential: Omeka S key credential
+            verbose: Enable verbose debug output (default: False)
         """
         self.api_url = api_url.rstrip('/')
         self.key_identity = key_identity
         self.key_credential = key_credential
+        self.verbose = verbose
         self.session = requests.Session()
 
         # Set up authentication as query parameters (Omeka S style)
@@ -56,155 +58,139 @@ class OmekaArtistProcessor:
             'Content-Type': 'application/json'
         })
 
-    def get_all_items(self, per_page: int = 100) -> List[Dict[str, Any]]:
+    def get_items_generator(self, itemset_id: Optional[int] = None, per_page: int = 100):
         """
-        Retrieve all items from the Omeka S instance.
+        Generator that yields pages of items one at a time for memory-efficient processing.
 
         Args:
+            itemset_id: Optional item set ID to filter by. If None, gets all items.
             per_page: Number of items to retrieve per page
 
-        Returns:
-            List of all items
+        Yields:
+            Tuple of (page_number, items_list) for each page
         """
-        items = []
         page = 1
 
         while True:
             url = f"{self.api_url}/items"
             params = {'page': page, 'per_page': per_page}
 
+            if itemset_id is not None:
+                params['item_set_id'] = itemset_id
+
             try:
-                print(f"DEBUG: Requesting {url} with params {params}")
+                source_desc = f"item set {itemset_id}" if itemset_id else "all items"
+                if self.verbose:
+                    print(f"DEBUG: Retrieving page {page} from {source_desc}")
+
                 response = self.session.get(url, params=params)
                 response.raise_for_status()
                 page_items = response.json()
 
                 if not page_items:
+                    if self.verbose:
+                        print(f"DEBUG: No more items on page {page}")
                     break
 
-                items.extend(page_items)
                 print(f"Retrieved page {page} ({len(page_items)} items)...")
+                yield page, page_items
                 page += 1
 
             except requests.exceptions.RequestException as e:
                 print(f"Error retrieving items on page {page}: {e}", file=sys.stderr)
                 break
 
-        return items
-
-    def get_items_from_itemset(self, itemset_id: int, per_page: int = 100) -> List[Dict[str, Any]]:
+    def process_contributors_streaming(
+            self,
+            source_itemset_id: Optional[int],
+            property_to_target_map: Dict[str, int],
+            per_page: int = 100
+    ) -> Dict[str, Dict[str, int]]:
         """
-        Retrieve all items from a specific item set.
+        Stream-process contributors: fetch page, extract, add to target sets, discard, repeat.
+        This is the most memory-efficient approach - never holds more than one page in memory.
 
         Args:
-            itemset_id: ID of the item set to retrieve items from
-            per_page: Number of items to retrieve per page
+            source_itemset_id: Optional item set ID to filter by. If None, processes all items.
+            property_to_target_map: Dict mapping property names to target item set IDs
+                                   e.g., {'rcl:artist': 123, 'rcl:author': 456}
+            per_page: Number of items per page
 
         Returns:
-            List of items in the item set
+            Dictionary mapping property names to stats dicts
         """
-        items = []
-        page = 1
+        property_names = list(property_to_target_map.keys())
 
-        while True:
-            url = f"{self.api_url}/items"
-            params = {
-                'page': page,
-                'per_page': per_page,
-                'item_set_id': itemset_id
-            }
+        # Track what we've already processed to avoid duplicates
+        processed_contributors = {prop: set() for prop in property_names}
 
-            try:
-                print(f"DEBUG: Requesting items from item set {itemset_id}, page {page}")
-                print(f"DEBUG: URL: {url}")
-                print(f"DEBUG: Params: {params}")
-                response = self.session.get(url, params=params)
-                print(f"DEBUG: Response status: {response.status_code}")
-                response.raise_for_status()
-                page_items = response.json()
+        # Statistics
+        stats = {prop: {'found': 0, 'added': 0, 'skipped': 0, 'errors': 0}
+                 for prop in property_names}
 
-                if not page_items:
-                    print(f"DEBUG: No more items on page {page}")
-                    break
+        total_items = 0
 
-                items.extend(page_items)
-                print(f"Retrieved page {page} ({len(page_items)} items from item set {itemset_id})...")
-                page += 1
+        print(f"\n{'='*60}")
+        print(f"STREAMING PROCESSING (True page-by-page)")
+        print(f"{'='*60}")
+        print(f"Properties: {', '.join(property_names)}")
+        print(f"Processing pages of {per_page} items each")
+        print(f"Adding contributors immediately after extraction from each page\n")
 
-            except requests.exceptions.RequestException as e:
-                print(f"Error retrieving items on page {page}: {e}", file=sys.stderr)
-                print(f"DEBUG: Response text: {response.text if 'response' in locals() else 'N/A'}", file=sys.stderr)
-                break
+        # Process one page at a time
+        for page_num, items in self.get_items_generator(source_itemset_id, per_page):
+            total_items += len(items)
+            print(f"\n--- Processing Page {page_num} ({len(items)} items) ---")
 
-        print(f"DEBUG: Total items retrieved from item set {itemset_id}: {len(items)}")
-        return items
+            # Extract contributors from this page
+            page_contributors = {prop: set() for prop in property_names}
 
-    def extract_contributor_items(self, items: List[Dict[str, Any]], property_name: str) -> Set[int]:
-        """
-        Extract all unique item IDs that are linked in a contributor property field.
+            for item in items:
+                for property_name in property_names:
+                    if property_name in item:
+                        contributors = item[property_name]
 
-        Args:
-            items: List of Omeka S items to process
-            property_name: Property name to extract (e.g., 'rcl:artist', 'rcl:author')
+                        if isinstance(contributors, list):
+                            for contributor in contributors:
+                                if isinstance(contributor, dict):
+                                    contributor_type = contributor.get('type')
+                                    value_resource_id = contributor.get('value_resource_id')
 
-        Returns:
-            Set of contributor item IDs
-        """
-        contributor_ids = set()
-        items_with_contributors = 0
-        items_without_contributors = 0
+                                    if contributor_type == 'resource:item' and value_resource_id:
+                                        # Only process if we haven't seen this contributor before
+                                        if value_resource_id not in processed_contributors[property_name]:
+                                            page_contributors[property_name].add(value_resource_id)
+                                            processed_contributors[property_name].add(value_resource_id)
+                                            stats[property_name]['found'] += 1
 
-        print(f"\nDEBUG: Processing {len(items)} items to extract {property_name} contributors...")
+            # Now add these contributors to their target item sets
+            # (items variable is now out of scope and can be garbage collected)
+            for property_name, contributor_ids in page_contributors.items():
+                if contributor_ids:
+                    target_itemset_id = property_to_target_map[property_name]
+                    print(f"\n  {property_name}: Adding {len(contributor_ids)} new contributors to item set {target_itemset_id}")
 
-        for idx, item in enumerate(items):
-            item_id = item.get('o:id', 'unknown')
-            item_title = item.get('o:title', 'Untitled')
+                    # Add this batch
+                    batch_stats = self.add_items_to_itemset(contributor_ids, target_itemset_id)
+                    stats[property_name]['added'] += batch_stats['added']
+                    stats[property_name]['skipped'] += batch_stats['skipped']
+                    stats[property_name]['errors'] += batch_stats['errors']
 
-            if (idx + 1) % 100 == 0:
-                print(f"DEBUG: Processed {idx + 1}/{len(items)} items so far...")
+            print(f"  Page {page_num} complete - memory freed for next page")
 
-            # Check if item has the specified property
-            if property_name in item:
-                items_with_contributors += 1
-                contributors = item[property_name]
+        print(f"\n{'='*60}")
+        print(f"STREAMING PROCESSING COMPLETE")
+        print(f"{'='*60}")
+        print(f"Total source items processed: {total_items}")
+        print(f"\nFinal Statistics:")
+        for property_name in property_names:
+            print(f"\n{property_name}:")
+            print(f"  Unique contributors found: {stats[property_name]['found']}")
+            print(f"  Added to target set: {stats[property_name]['added']}")
+            print(f"  Already in set (skipped): {stats[property_name]['skipped']}")
+            print(f"  Errors: {stats[property_name]['errors']}")
 
-                print(f"\nDEBUG: Item {item_id} ('{item_title}') has {property_name} field")
-                print(f"DEBUG: {property_name} type: {type(contributors)}")
-                print(f"DEBUG: {property_name} value: {contributors}")
-
-                # Property can be a list of resources
-                if isinstance(contributors, list):
-                    print(f"DEBUG: Found {len(contributors)} contributor(s) in list")
-                    for contributor_idx, contributor in enumerate(contributors):
-                        print(f"DEBUG:   Contributor {contributor_idx}: type={type(contributor)}, value={contributor}")
-
-                        # Each contributor should be a resource reference
-                        if isinstance(contributor, dict):
-                            contributor_type = contributor.get('type')
-                            value_resource_id = contributor.get('value_resource_id')
-
-                            print(f"DEBUG:     Contributor type field: {contributor_type}")
-                            print(f"DEBUG:     value_resource_id: {value_resource_id}")
-
-                            if contributor_type == 'resource:item' and value_resource_id:
-                                contributor_ids.add(value_resource_id)
-                                print(f"DEBUG:     ✓ Added contributor ID {value_resource_id} to set")
-                            else:
-                                print(f"DEBUG:     ✗ Skipped - type mismatch or missing ID")
-                        else:
-                            print(f"DEBUG:     ✗ Skipped - not a dict")
-                else:
-                    print(f"DEBUG: {property_name} is not a list, it's a {type(contributors)}")
-            else:
-                items_without_contributors += 1
-
-        print(f"\nDEBUG: Summary for {property_name}:")
-        print(f"DEBUG:   Items with {property_name}: {items_with_contributors}")
-        print(f"DEBUG:   Items without {property_name}: {items_without_contributors}")
-        print(f"DEBUG:   Unique contributor IDs found: {len(contributor_ids)}")
-        print(f"DEBUG:   Contributor IDs: {sorted(contributor_ids)}")
-
-        return contributor_ids
+        return stats
 
     def add_items_to_itemset(self, item_ids: Set[int], itemset_id: int) -> Dict[str, int]:
         """
@@ -221,31 +207,45 @@ class OmekaArtistProcessor:
         error_count = 0
         already_in_set = 0
 
-        print(f"\nDEBUG: Starting to add {len(item_ids)} items to item set {itemset_id}")
+        if self.verbose:
+            print(f"\nDEBUG: Starting to add {len(item_ids)} items to item set {itemset_id}")
 
         for idx, item_id in enumerate(item_ids, 1):
+            # Show progress every 10 items (even in non-verbose mode)
+            if not self.verbose and idx % 10 == 0:
+                print(f"Progress: {idx}/{len(item_ids)} items processed...")
+
             try:
-                print(f"\n--- Processing item {idx}/{len(item_ids)}: ID {item_id} ---")
+                if self.verbose:
+                    print(f"\n--- Processing item {idx}/{len(item_ids)}: ID {item_id} ---")
 
                 # Get current item data
                 item_url = f"{self.api_url}/items/{item_id}"
-                print(f"DEBUG: GET request to: {item_url}")
+                if self.verbose:
+                    print(f"DEBUG: GET request to: {item_url}")
+
                 response = self.session.get(item_url)
-                print(f"DEBUG: GET response status: {response.status_code}")
+
+                if self.verbose:
+                    print(f"DEBUG: GET response status: {response.status_code}")
+
                 response.raise_for_status()
                 item_data = response.json()
 
                 item_title = item_data.get('o:title', 'Untitled')
-                print(f"DEBUG: Item title: '{item_title}'")
+                if self.verbose:
+                    print(f"DEBUG: Item title: '{item_title}'")
 
                 # Check if item is already in the item set
                 current_itemsets = item_data.get('o:item_set', [])
                 itemset_ids = [s['o:id'] for s in current_itemsets]
 
-                print(f"DEBUG: Current item sets for this item: {itemset_ids}")
+                if self.verbose:
+                    print(f"DEBUG: Current item sets for this item: {itemset_ids}")
 
                 if itemset_id in itemset_ids:
-                    print(f"DEBUG: Item {item_id} is already in target item set {itemset_id} - skipping")
+                    if self.verbose:
+                        print(f"DEBUG: Item {item_id} is already in target item set {itemset_id} - skipping")
                     already_in_set += 1
                     success_count += 1
                     continue
@@ -257,11 +257,12 @@ class OmekaArtistProcessor:
                     'o:id': itemset_id
                 }
                 current_itemsets.append(new_item_set)
-                new_itemset_ids = [s['o:id'] for s in current_itemsets]
 
-                print(f"DEBUG: Adding item set {itemset_id} to item {item_id}")
-                print(f"DEBUG: New item set list will be: {new_itemset_ids}")
-                print(f"DEBUG: New item set entry: {new_item_set}")
+                if self.verbose:
+                    new_itemset_ids = [s['o:id'] for s in current_itemsets]
+                    print(f"DEBUG: Adding item set {itemset_id} to item {item_id}")
+                    print(f"DEBUG: New item set list will be: {new_itemset_ids}")
+                    print(f"DEBUG: New item set entry: {new_item_set}")
 
                 # Update the item data with new item sets
                 item_data['o:item_set'] = current_itemsets
@@ -274,10 +275,11 @@ class OmekaArtistProcessor:
 
                 update_data = {k: v for k, v in item_data.items() if k not in fields_to_remove}
 
-                print(f"DEBUG: PUT data keys: {list(update_data.keys())}")
-                print(f"DEBUG: o:item_set value: {update_data.get('o:item_set')}")
-                print(f"DEBUG: PUT request to: {item_url}")
-                print(f"DEBUG: Auth being used: key_identity={self.key_identity}")
+                if self.verbose:
+                    print(f"DEBUG: PUT data keys: {list(update_data.keys())}")
+                    print(f"DEBUG: o:item_set value: {update_data.get('o:item_set')}")
+                    print(f"DEBUG: PUT request to: {item_url}")
+                    print(f"DEBUG: Auth being used: key_identity={self.key_identity}")
 
                 # Use PUT instead of PATCH (Omeka S uses PUT)
                 response = self.session.put(
@@ -286,24 +288,28 @@ class OmekaArtistProcessor:
                     headers={'Content-Type': 'application/json'}
                 )
 
-                print(f"DEBUG: PUT response status: {response.status_code}")
+                if self.verbose:
+                    print(f"DEBUG: PUT response status: {response.status_code}")
 
                 # Print response details if there's an error
                 if response.status_code != 200:
                     print(f"ERROR: Response status: {response.status_code}", file=sys.stderr)
-                    print(f"ERROR: Response headers: {dict(response.headers)}", file=sys.stderr)
+                    if self.verbose:
+                        print(f"ERROR: Response headers: {dict(response.headers)}", file=sys.stderr)
                     print(f"ERROR: Response body: {response.text}", file=sys.stderr)
 
                 response.raise_for_status()
 
-                print(f"SUCCESS: Added item {item_id} ('{item_title}') to item set {itemset_id}")
+                if self.verbose:
+                    print(f"SUCCESS: Added item {item_id} ('{item_title}') to item set {itemset_id}")
                 success_count += 1
 
             except requests.exceptions.RequestException as e:
                 print(f"ERROR: Failed to add item {item_id} to item set: {e}", file=sys.stderr)
                 if hasattr(e, 'response') and e.response is not None:
                     print(f"ERROR: Response status: {e.response.status_code}", file=sys.stderr)
-                    print(f"ERROR: Response body: {e.response.text}", file=sys.stderr)
+                    if self.verbose:
+                        print(f"ERROR: Response body: {e.response.text}", file=sys.stderr)
                 error_count += 1
 
         print(f"\n=== PROCESSING SUMMARY ===")
@@ -423,38 +429,14 @@ def process_contributor_type(
         return {'found': 0, 'added': 0, 'errors': 0, 'skipped': 0}
     print(f"✓ Target item set {target_itemset_id} exists")
 
-    # Get items from source
-    if source_itemset_id is None:
-        print(f"\nRetrieving all items from Omeka S instance...")
-        items = processor.get_all_items()
-    else:
-        print(f"\nRetrieving items from source item set {source_itemset_id}...")
-        items = processor.get_items_from_itemset(source_itemset_id)
+    # TRUE STREAMING: Process page-by-page, adding contributors immediately
+    property_to_target_map = {property_name: target_itemset_id}
+    all_stats = processor.process_contributors_streaming(
+        source_itemset_id,
+        property_to_target_map
+    )
 
-    print(f"Retrieved {len(items)} items")
-
-    if not items:
-        print("No items found in source. Nothing to do.")
-        return {'found': 0, 'added': 0, 'errors': 0, 'skipped': 0}
-
-    # Extract contributor IDs
-    print(f"\nExtracting contributors from {property_name} fields...")
-    contributor_ids = processor.extract_contributor_items(items, property_name)
-
-    if not contributor_ids:
-        print(f"\nNo {contributor_name.lower()} found. Nothing to do.")
-        return {'found': 0, 'added': 0, 'errors': 0, 'skipped': 0}
-
-    # Add contributors to target item set
-    print(f"\nAdding {len(contributor_ids)} {contributor_name.lower()} to target item set {target_itemset_id}...")
-    stats = processor.add_items_to_itemset(contributor_ids, target_itemset_id)
-
-    return {
-        'found': len(contributor_ids),
-        'added': stats['added'],
-        'errors': stats['errors'],
-        'skipped': stats['skipped']
-    }
+    return all_stats[property_name]
 
 
 def main():
@@ -481,10 +463,12 @@ def main():
     print(f"API URL: {api_url}")
     print(f"Key Identity: {key_identity[:10]}...")
 
+    # Initialize with verbose=False for clean output (set to True for debugging)
     processor = OmekaArtistProcessor(
         api_url,
         key_identity,
-        key_credential
+        key_credential,
+        verbose=False
     )
 
     # Display menu and get choice
@@ -509,26 +493,34 @@ def main():
         print("="*60)
         print("\nYou will be prompted for a target item set for each type.")
 
-        targets = {}
         # Get target item sets for each contributor type
+        property_to_target_map = {}
         for key in sorted(CONTRIBUTOR_TYPES.keys()):
             if key == '8':  # Skip "All" option
                 continue
             contributor = CONTRIBUTOR_TYPES[key]
-            targets[key] = get_target_itemset(contributor['name'])
+            target_id = get_target_itemset(contributor['name'])
+            property_to_target_map[contributor['property']] = target_id
 
-        # Process each contributor type
-        all_stats = {}
-        for key in sorted(targets.keys()):
+            # Verify target exists
+            if not processor.verify_itemset_exists(target_id):
+                print(f"ERROR: Target item set {target_id} does not exist", file=sys.stderr)
+                sys.exit(1)
+
+        # TRUE STREAMING: Process page-by-page, adding contributors immediately
+        all_stats = processor.process_contributors_streaming(
+            source_itemset_id,
+            property_to_target_map
+        )
+
+        # Convert stats format for display
+        display_stats = {}
+        for key in sorted(CONTRIBUTOR_TYPES.keys()):
+            if key == '8':
+                continue
             contributor = CONTRIBUTOR_TYPES[key]
-            stats = process_contributor_type(
-                processor,
-                contributor['name'],
-                contributor['property'],
-                source_itemset_id,
-                targets[key]
-            )
-            all_stats[contributor['name']] = stats
+            property_name = contributor['property']
+            display_stats[contributor['name']] = all_stats[property_name]
 
         # Print overall summary
         print("\n" + "="*60)
